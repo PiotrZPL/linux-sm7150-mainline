@@ -146,7 +146,9 @@ struct goodix_gtx8_core {
 	size_t config_len;
 	/* Protects event_buffer and event/status register handling. */
 	struct mutex event_lock;
+	struct delayed_work auto_wake_work;
 	struct delayed_work poll_work;
+	bool auto_wake_enabled;
 	unsigned int poll_interval_ms;
 	unsigned int poll_error_count;
 	unsigned int poll_attempts_left;

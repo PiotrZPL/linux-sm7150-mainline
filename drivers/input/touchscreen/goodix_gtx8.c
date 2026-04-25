@@ -69,7 +69,11 @@ static const struct input_id goodix_gtx8_input_id = {
 #define GOODIX_GTX8_POLL_MAX_ERRORS		3
 #define GOODIX_GTX8_WAKE_POLL_INTERVAL_MS	150
 #define GOODIX_GTX8_WAKE_POLL_ATTEMPTS		2000
+#define GOODIX_GTX8_AUTO_WAKE_POLL_ATTEMPTS	80
+#define GOODIX_GTX8_AUTO_WAKE_REPEAT_MS		3000
 #define GOODIX_GTX8_WAKE_ADDR			0x38
+#define GOODIX_GTX8_BOOT_WAKE_DELAY_MS		15000
+#define GOODIX_GTX8_RESUME_WAKE_DELAY_MS	750
 
 static const u8 goodix_gtx8_wake_regs[] = {
 	0xa3, 0x9f, 0xa8, 0x00, 0x01,
@@ -826,12 +830,6 @@ static int goodix_gtx8_handle_events(struct goodix_gtx8_core *cd)
 		goto out_clear;
 	}
 
-	if ((status & GOODIX_GTX8_TOUCH_EVENT) && cd->poll_attempts_left &&
-	    FIELD_GET(GOODIX_GTX8_TOUCH_COUNT_MASK, touch_num)) {
-		cd->poll_attempts_left = 0;
-		WRITE_ONCE(cd->poll_interval_ms, 0);
-	}
-
 	if (status & GOODIX_GTX8_TOUCH_EVENT)
 		goodix_gtx8_touch_handler(cd, touch_num, touch_data);
 
@@ -896,13 +894,49 @@ static void goodix_gtx8_wake_probe_alt_addr(struct goodix_gtx8_core *cd)
 	}
 }
 
-static void goodix_gtx8_start_wake_poll(struct goodix_gtx8_core *cd)
+static void goodix_gtx8_start_wake_poll(struct goodix_gtx8_core *cd,
+					unsigned int attempts)
 {
 	cd->poll_error_count = 0;
-	cd->poll_attempts_left = GOODIX_GTX8_WAKE_POLL_ATTEMPTS;
+	cd->poll_attempts_left = attempts;
+	mutex_lock(&cd->event_lock);
 	goodix_gtx8_wake_probe_alt_addr(cd);
+	mutex_unlock(&cd->event_lock);
 	WRITE_ONCE(cd->poll_interval_ms, GOODIX_GTX8_WAKE_POLL_INTERVAL_MS);
 	goodix_gtx8_queue_poll(cd);
+}
+
+static void goodix_gtx8_schedule_auto_wake(struct goodix_gtx8_core *cd,
+					   unsigned int delay_ms)
+{
+	cd->auto_wake_enabled = true;
+	mod_delayed_work(system_wq, &cd->auto_wake_work,
+			 msecs_to_jiffies(delay_ms));
+}
+
+static void goodix_gtx8_auto_wake_work(struct work_struct *work)
+{
+	struct goodix_gtx8_core *cd = container_of(to_delayed_work(work),
+						  struct goodix_gtx8_core,
+						  auto_wake_work);
+
+	if (!cd->auto_wake_enabled)
+		return;
+
+	goodix_gtx8_start_wake_poll(cd, GOODIX_GTX8_AUTO_WAKE_POLL_ATTEMPTS);
+	if (cd->auto_wake_enabled)
+		goodix_gtx8_schedule_auto_wake(cd,
+					       GOODIX_GTX8_AUTO_WAKE_REPEAT_MS);
+}
+
+static void goodix_gtx8_cancel_wake(struct goodix_gtx8_core *cd)
+{
+	cd->auto_wake_enabled = false;
+	cancel_delayed_work_sync(&cd->auto_wake_work);
+	WRITE_ONCE(cd->poll_interval_ms, 0);
+	cancel_delayed_work_sync(&cd->poll_work);
+	cd->poll_error_count = 0;
+	cd->poll_attempts_left = 0;
 }
 
 static void goodix_gtx8_poll_work(struct work_struct *work)
@@ -968,10 +1002,7 @@ static ssize_t poll_interval_ms_store(struct device *dev,
 			 interval > GOODIX_GTX8_POLL_INTERVAL_MAX_MS))
 		return -EINVAL;
 
-	WRITE_ONCE(cd->poll_interval_ms, 0);
-	cancel_delayed_work_sync(&cd->poll_work);
-	cd->poll_error_count = 0;
-	cd->poll_attempts_left = 0;
+	goodix_gtx8_cancel_wake(cd);
 	WRITE_ONCE(cd->poll_interval_ms, interval);
 	goodix_gtx8_queue_poll(cd);
 
@@ -992,15 +1023,13 @@ static ssize_t wake_sequence_store(struct device *dev,
 	if (error)
 		return error;
 
-	WRITE_ONCE(cd->poll_interval_ms, 0);
-	cancel_delayed_work_sync(&cd->poll_work);
-	cd->poll_error_count = 0;
-	cd->poll_attempts_left = 0;
+	goodix_gtx8_cancel_wake(cd);
 
 	if (!enable)
 		return count;
 
-	goodix_gtx8_start_wake_poll(cd);
+	goodix_gtx8_start_wake_poll(cd, GOODIX_GTX8_WAKE_POLL_ATTEMPTS);
+	goodix_gtx8_schedule_auto_wake(cd, GOODIX_GTX8_AUTO_WAKE_REPEAT_MS);
 
 	return count;
 }
@@ -1167,7 +1196,7 @@ static int goodix_gtx8_suspend(struct device *dev)
 {
 	struct goodix_gtx8_core *cd = dev_get_drvdata(dev);
 
-	cancel_delayed_work_sync(&cd->poll_work);
+	goodix_gtx8_cancel_wake(cd);
 	disable_irq(cd->irq);
 	goodix_gtx8_power_off(cd);
 
@@ -1186,6 +1215,7 @@ static int goodix_gtx8_resume(struct device *dev)
 	goodix_gtx8_init_config(cd);
 
 	enable_irq(cd->irq);
+	goodix_gtx8_schedule_auto_wake(cd, GOODIX_GTX8_RESUME_WAKE_DELAY_MS);
 
 	return 0;
 }
@@ -1197,7 +1227,7 @@ static void goodix_gtx8_power_off_act(void *data)
 {
 	struct goodix_gtx8_core *cd = data;
 
-	cancel_delayed_work_sync(&cd->poll_work);
+	goodix_gtx8_cancel_wake(cd);
 	goodix_gtx8_power_off(cd);
 }
 
@@ -1222,6 +1252,7 @@ static int goodix_gtx8_probe(struct i2c_client *client)
 	cd->ic_data = i2c_get_match_data(client);
 	cd->touch_data_addr = cd->ic_data->touch_data_addr;
 	mutex_init(&cd->event_lock);
+	INIT_DELAYED_WORK(&cd->auto_wake_work, goodix_gtx8_auto_wake_work);
 	INIT_DELAYED_WORK(&cd->poll_work, goodix_gtx8_poll_work);
 
 	cd->event_buffer =
@@ -1297,6 +1328,8 @@ static int goodix_gtx8_probe(struct i2c_client *client)
 	error = devm_device_add_group(cd->dev, &goodix_gtx8_attr_group);
 	if (error)
 		return error;
+
+	goodix_gtx8_schedule_auto_wake(cd, GOODIX_GTX8_BOOT_WAKE_DELAY_MS);
 
 	dev_dbg(cd->dev,
 		"Goodix GT%c%c%c%c Touchscreen Controller, Version %d.%d.%d.%d\n",
