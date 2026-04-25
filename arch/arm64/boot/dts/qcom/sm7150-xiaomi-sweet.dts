@@ -187,7 +187,10 @@
 	touchscreen: goodix@5d {
 		compatible = "goodix,gt9896";
 		reg = <0x5d>;
-		interrupts-extended = <&tlmm 9 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&ts_int_active &ts_reset_active>;
+		pinctrl-1 = <&ts_int_suspend &ts_reset_suspend>;
+		interrupts-extended = <&tlmm 9 IRQ_TYPE_EDGE_FALLING>;
 		reset-gpios = <&tlmm 8 GPIO_ACTIVE_LOW>;
 		avdd-supply = <&vreg_l11c_3p3>;
 		vddio-supply = <&vreg_ts_vddio>;

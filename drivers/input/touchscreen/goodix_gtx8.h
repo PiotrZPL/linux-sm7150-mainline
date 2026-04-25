@@ -2,6 +2,10 @@
 #ifndef __GOODIX_GTX8_H__
 #define __GOODIX_GTX8_H__
 
+#include <linux/mutex.h>
+#include <linux/sizes.h>
+#include <linux/workqueue.h>
+
 #define GOODIX_GTX8_NORMAL_RESET_DELAY_MS	100
 #define GOODIX_GTX8_POWER_ON_DELAY_MS		300
 
@@ -12,6 +16,7 @@
 
 #define GOODIX_GTX8_MAX_TOUCH			10
 #define GOODIX_GTX8_CHECKSUM_SIZE		sizeof(u16)
+#define GOODIX_GTX8_CFG_MAX_SIZE		SZ_4K
 
 #define GOODIX_GTX8_FW_VERSION_ADDR_NORMANDY	0x4535
 #define GOODIX_GTX8_FW_VERSION_ADDR_YELLOWSTONE	0x4022
@@ -27,6 +32,7 @@ enum goodix_gtx8_ic_type {
 
 struct goodix_gtx8_ic_data {
 	size_t event_size;
+	size_t pre_read_size;
 	/*
 	 * This is technically not the firmware version address
 	 * referenced in the vendor driver, but rather the
@@ -39,6 +45,9 @@ struct goodix_gtx8_ic_data {
 	enum goodix_gtx8_ic_type ic_type;
 	char product_id[4];
 	int touch_data_addr;
+	const char *config_name;
+	const u8 *config_fallback;
+	size_t config_fallback_size;
 };
 
 struct goodix_gtx8_header_normandy {
@@ -106,7 +115,7 @@ struct goodix_gtx8_event_yellowstone {
 	struct goodix_gtx8_header_yellowstone hdr;
 	/* The data below is u16 aligned */
 	u8 data[GOODIX_GTX8_TOUCH_SIZE * GOODIX_GTX8_MAX_TOUCH +
-		GOODIX_GTX8_CHECKSUM_SIZE];
+		GOODIX_GTX8_CHECKSUM_SIZE + 1];
 };
 #define GOODIX_GTX8_EVENT_SIZE_YELLOWSTONE \
 	sizeof(struct goodix_gtx8_event_yellowstone)
@@ -128,10 +137,24 @@ struct goodix_gtx8_core {
 	struct gpio_desc *reset_gpio;
 	struct touchscreen_properties props;
 	struct goodix_gtx8_fw_version fw_version;
+	struct i2c_client *client;
 	struct input_dev *input_dev;
 	int irq;
 	const struct goodix_gtx8_ic_data *ic_data;
 	u8 *event_buffer;
+	u8 *config;
+	size_t config_len;
+	/* Protects event_buffer and event/status register handling. */
+	struct mutex event_lock;
+	struct delayed_work poll_work;
+	unsigned int poll_interval_ms;
+	unsigned int poll_error_count;
+	unsigned int poll_attempts_left;
+	u32 config_addr;
+	u32 command_addr;
+	u32 esd_addr;
+	u32 fw_request_addr;
+	u32 touch_data_addr;
 };
 
 #endif
