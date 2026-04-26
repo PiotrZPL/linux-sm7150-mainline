@@ -61,6 +61,8 @@ static const struct input_id goodix_gtx8_input_id = {
 #define GOODIX_GTX8_CMD_REG_READY		0xff
 
 #define GOODIX_GTX8_CFG_REPLY_DATA_EQU		0x07
+#define GOODIX_GTX8_CONFIRM_RETRIES		20
+#define GOODIX_GTX8_CONFIRM_RETRY_DELAY_US	50000
 #define GOODIX_GTX8_WAIT_CMD_FREE_RETRY		10
 #define GOODIX_GTX8_WAIT_CFG_READY_RETRY	30
 #define GOODIX_GTX8_REG_ADDR_SIZE		2
@@ -1120,7 +1122,7 @@ static int goodix_gtx8_read_version(struct goodix_gtx8_core *cd)
 static int goodix_gtx8_dev_confirm(struct goodix_gtx8_core *cd)
 {
 	u8 rx_buf[1];
-	int retry = 3;
+	int retry = GOODIX_GTX8_CONFIRM_RETRIES;
 	int error;
 
 	while (retry--) {
@@ -1136,15 +1138,14 @@ static int goodix_gtx8_dev_confirm(struct goodix_gtx8_core *cd)
 		if (!error)
 			return 0;
 
-		usleep_range(5000, 5100);
+		usleep_range(GOODIX_GTX8_CONFIRM_RETRY_DELAY_US,
+			     GOODIX_GTX8_CONFIRM_RETRY_DELAY_US + 1000);
 	}
-
-	dev_err(cd->dev, "device confirm failed\n");
 
 	return -EINVAL;
 }
 
-static int goodix_gtx8_power_on(struct goodix_gtx8_core *cd)
+static int goodix_gtx8_power_on(struct goodix_gtx8_core *cd, bool strict_confirm)
 {
 	int error;
 
@@ -1169,8 +1170,14 @@ static int goodix_gtx8_power_on(struct goodix_gtx8_core *cd)
 	usleep_range(5000, 5100);
 
 	error = goodix_gtx8_dev_confirm(cd);
-	if (error)
+	if (error && strict_confirm) {
+		dev_err(cd->dev, "device confirm failed\n");
 		goto err_dev_reset;
+	}
+
+	if (error)
+		dev_warn(cd->dev,
+			 "device confirm failed, continuing resume recovery\n");
 
 	/* Vendor waits 100ms for firmware to fully boot */
 	msleep(GOODIX_GTX8_NORMAL_RESET_DELAY_MS);
@@ -1208,7 +1215,7 @@ static int goodix_gtx8_resume(struct device *dev)
 	struct goodix_gtx8_core *cd = dev_get_drvdata(dev);
 	int error;
 
-	error = goodix_gtx8_power_on(cd);
+	error = goodix_gtx8_power_on(cd, false);
 	if (error)
 		return error;
 
@@ -1276,7 +1283,7 @@ static int goodix_gtx8_probe(struct i2c_client *client)
 		return dev_err_probe(cd->dev, PTR_ERR(cd->vddio),
 				     "Failed to request VDDIO regulator\n");
 
-	error = goodix_gtx8_power_on(cd);
+	error = goodix_gtx8_power_on(cd, true);
 	if (error) {
 		dev_err(cd->dev, "failed power on");
 		return error;
